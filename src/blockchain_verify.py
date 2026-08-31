@@ -29,6 +29,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from web3 import Web3
 
@@ -36,13 +37,33 @@ CONTRACT_SOL_PATH = os.path.join(
     os.path.dirname(__file__), "..", "contracts", "RecordRegistry.sol"
 )
 _SOLC_VERSION = "0.8.19"
+_CONTRACT_ARTIFACTS_CACHE: tuple[list, str] | None = None
+_LOCAL_W3_ACCOUNT = None
+_LOCAL_CONTRACT_ADDRESS: str | None = None
 
 
-def _compile_contract():
+def normalize_hash(value: Any) -> str:
+    """
+    Normalizes a hash representation (str, bytes, or HexBytes) to lowercase hex without '0x' prefix.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        hex_str = value.hex()
+    elif hasattr(value, "hex") and callable(getattr(value, "hex")):
+        hex_str = value.hex()
+    else:
+        hex_str = str(value)
+
+    hex_str = hex_str.strip().lower()
+    if hex_str.startswith("0x"):
+        hex_str = hex_str[2:]
+    return hex_str
+
+
+def _compile_contract() -> tuple[list, str]:
     """
     Compiles contracts/RecordRegistry.sol on the fly using py-solc-x.
-    Caches the solc binary locally after the first run (needs internet
-    the very first time you run the pipeline; none after that).
     """
     import solcx
 
@@ -60,7 +81,28 @@ def _compile_contract():
     return compiled[key]["abi"], compiled[key]["bin"]
 
 
-CONTRACT_ABI, CONTRACT_BYTECODE = _compile_contract()
+def get_contract_artifacts() -> tuple[list, str]:
+    """
+    Retrieves ABI and bytecode for RecordRegistry.
+    Checks pre-compiled JSON file first, falling back to py-solc-x compilation if available.
+    Caches the result in memory so compilation occurs at most once per execution.
+    """
+    global _CONTRACT_ARTIFACTS_CACHE
+    if _CONTRACT_ARTIFACTS_CACHE is not None:
+        return _CONTRACT_ARTIFACTS_CACHE
+
+    json_path = os.path.join(
+        os.path.dirname(__file__), "..", "contracts", "RecordRegistry.json"
+    )
+    if os.path.exists(json_path):
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if "abi" in data and "bytecode" in data:
+                _CONTRACT_ARTIFACTS_CACHE = (data["abi"], data["bytecode"])
+                return _CONTRACT_ARTIFACTS_CACHE
+
+    _CONTRACT_ARTIFACTS_CACHE = _compile_contract()
+    return _CONTRACT_ARTIFACTS_CACHE
 
 
 @dataclass
@@ -94,13 +136,16 @@ def _get_web3_and_account():
     mode = os.environ.get("BLOCKCHAIN_MODE", "local")
 
     if mode == "local":
-        from eth_tester import EthereumTester
-        from web3.providers.eth_tester import EthereumTesterProvider
+        global _LOCAL_W3_ACCOUNT
+        if _LOCAL_W3_ACCOUNT is None:
+            from eth_tester import EthereumTester
+            from web3.providers.eth_tester import EthereumTesterProvider
 
-        tester = EthereumTester()
-        w3 = Web3(EthereumTesterProvider(tester))
-        account = w3.eth.accounts[0]
-        return w3, account, None  # no private key needed for eth-tester
+            tester = EthereumTester()
+            w3 = Web3(EthereumTesterProvider(tester))
+            account = w3.eth.accounts[0]
+            _LOCAL_W3_ACCOUNT = (w3, account, None)
+        return _LOCAL_W3_ACCOUNT
 
     elif mode == "testnet":
         provider_url = os.environ["WEB3_PROVIDER_URL"]  # e.g. Infura Sepolia endpoint
@@ -119,11 +164,14 @@ def deploy_or_get_contract(w3: Web3, account: str, private_key: str | None):
     connects to the existing deployment. Deployment cost on the local
     tester is free/instant; on testnet it costs a small amount of test ETH.
     """
-    existing = os.environ.get("CONTRACT_ADDRESS")
-    if existing:
-        return w3.eth.contract(address=Web3.to_checksum_address(existing), abi=CONTRACT_ABI)
+    global _LOCAL_CONTRACT_ADDRESS
+    existing = os.environ.get("CONTRACT_ADDRESS") or _LOCAL_CONTRACT_ADDRESS
+    abi, bytecode = get_contract_artifacts()
 
-    Contract = w3.eth.contract(abi=CONTRACT_ABI, bytecode=CONTRACT_BYTECODE)
+    if existing:
+        return w3.eth.contract(address=Web3.to_checksum_address(existing), abi=abi)
+
+    Contract = w3.eth.contract(abi=abi, bytecode=bytecode)
 
     if private_key is None:
         tx_hash = Contract.constructor().transact({"from": account})
@@ -136,8 +184,11 @@ def deploy_or_get_contract(w3: Web3, account: str, private_key: str | None):
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
 
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    if os.environ.get("BLOCKCHAIN_MODE", "local") == "local":
+        _LOCAL_CONTRACT_ADDRESS = receipt.contractAddress
+
     print(f"Contract deployed at {receipt.contractAddress}")
-    return w3.eth.contract(address=receipt.contractAddress, abi=CONTRACT_ABI)
+    return w3.eth.contract(address=receipt.contractAddress, abi=abi)
 
 
 def upload_record(record_id: str, data_hash_hex: str) -> OnChainRecord:
@@ -148,7 +199,7 @@ def upload_record(record_id: str, data_hash_hex: str) -> OnChainRecord:
     contract = deploy_or_get_contract(w3, account, private_key)
 
     record_id_bytes = Web3.keccak(text=record_id)
-    data_hash_bytes = bytes.fromhex(data_hash_hex)
+    data_hash_bytes = bytes.fromhex(normalize_hash(data_hash_hex))
 
     if private_key is None:
         tx_hash = contract.functions.registerRecord(record_id_bytes, data_hash_bytes).transact(
@@ -168,7 +219,7 @@ def upload_record(record_id: str, data_hash_hex: str) -> OnChainRecord:
 
     return OnChainRecord(
         record_id=record_id,
-        data_hash=stored_hash.hex(),
+        data_hash=normalize_hash(stored_hash),
         uploader=uploader,
         timestamp=timestamp,
         tx_hash=receipt.transactionHash.hex(),
@@ -186,7 +237,7 @@ def verify_record(record_id: str, expected_hash_hex: str) -> bool:
     record_id_bytes = Web3.keccak(text=record_id)
     stored_hash, uploader, timestamp = contract.functions.getRecord(record_id_bytes).call()
 
-    return stored_hash.hex().lower() == expected_hash_hex.lower()
+    return normalize_hash(stored_hash) == normalize_hash(expected_hash_hex)
 
 
 if __name__ == "__main__":
@@ -196,3 +247,4 @@ if __name__ == "__main__":
     record = upload_record(record_id=f"demo-{int(time.time())}", data_hash_hex=demo_hash)
     print(record)
     print("Verified:", verify_record(record.record_id, demo_hash))
+
