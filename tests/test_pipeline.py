@@ -281,3 +281,30 @@ def test_tamper_detection_assertion(mock_verify, mock_upload):
 
     assert tampered_hash != orig_hash
     assert mock_verify(record_id, tampered_hash) is False
+
+
+# --- Test 8: test_pipeline_corrupt_candidate_image_no_upload ---
+
+@patch("src.pipeline.encode_face")
+@patch("src.pipeline.search_by_image")
+@patch("src.pipeline.download_candidate_image")
+@patch("src.pipeline.upload_record")
+def test_pipeline_corrupt_candidate_image_no_upload(
+    mock_upload,
+    mock_download,
+    mock_search,
+    mock_encode,
+    dummy_face_result,
+    dummy_web_matches,
+):
+    mock_encode.return_value = dummy_face_result
+    mock_search.return_value = dummy_web_matches
+    # Download returns corrupted bytes
+    mock_download.return_value = b"CORRUPTED_BYTES_123"
+
+    res = run_pipeline("dummy_path.jpg", tolerance=0.6)
+
+    assert res.status == "NO_FACES_DETECTED"
+    assert res.candidates_evaluated == 2
+    assert res.record_id is None
+    mock_upload.assert_not_called()

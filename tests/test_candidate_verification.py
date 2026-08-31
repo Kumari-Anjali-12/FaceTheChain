@@ -14,6 +14,8 @@ from PIL import Image
 from src.face_id import (
     CandidateVerificationResult,
     _load_image_from_input,
+    validate_input_encoding,
+    validate_tolerance,
     verify_candidate_face,
 )
 
@@ -185,3 +187,119 @@ def test_candidate_verification_result_repr():
     assert "best_distance=0.1235" in repr_str
     assert "0.123456" not in repr_str  # rounded representation
     assert "array" not in repr_str  # raw embedding not exposed
+
+
+# --- New Hardening & Verification Correctness Tests ---
+
+def test_malformed_input_encoding_validation():
+    with pytest.raises(ValueError, match="input_encoding cannot be None"):
+        validate_input_encoding(None)
+
+    with pytest.raises(ValueError, match="input_encoding must be a numpy array or list"):
+        validate_input_encoding("invalid_string_encoding")
+
+    with pytest.raises(ValueError, match="input_encoding must be 1-dimensional with length 128"):
+        validate_input_encoding([1.0, 2.0, 3.0])  # Length 3
+
+    with pytest.raises(ValueError, match="input_encoding must be 1-dimensional with length 128"):
+        validate_input_encoding(np.zeros((10, 128)))  # 2D array
+
+
+def test_nan_inf_encoding_validation():
+    enc_nan = np.zeros(128, dtype=np.float64)
+    enc_nan[0] = np.nan
+    with pytest.raises(ValueError, match="contains NaN or infinite values"):
+        validate_input_encoding(enc_nan)
+
+    enc_inf = np.zeros(128, dtype=np.float64)
+    enc_inf[10] = np.inf
+    with pytest.raises(ValueError, match="contains NaN or infinite values"):
+        validate_input_encoding(enc_inf)
+
+
+def test_wrong_encoding_dimensions():
+    with pytest.raises(ValueError, match="length 128"):
+        validate_input_encoding(np.zeros(64))
+
+    with pytest.raises(ValueError, match="length 128"):
+        validate_input_encoding(np.zeros(256))
+
+
+def test_tolerance_validation():
+    with pytest.raises(ValueError, match="must be a numeric float/int"):
+        validate_tolerance("strict")
+
+    with pytest.raises(ValueError, match="must be a numeric float/int"):
+        validate_tolerance(True)
+
+    with pytest.raises(ValueError, match="must be finite"):
+        validate_tolerance(float("nan"))
+
+    with pytest.raises(ValueError, match="must be finite"):
+        validate_tolerance(float("inf"))
+
+    with pytest.raises(ValueError, match="out of sensible range"):
+        validate_tolerance(-0.1)
+
+    with pytest.raises(ValueError, match="out of sensible range"):
+        validate_tolerance(2.5)
+
+    assert validate_tolerance(0.6) == 0.6
+    assert validate_tolerance(0) == 0.0
+
+
+@patch("face_recognition.face_encodings")
+@patch("face_recognition.face_locations")
+def test_exact_threshold_behavior(mock_locations, mock_encodings, input_encoding):
+    mock_locations.return_value = [(0, 10, 10, 0)]
+    dummy_bytes = create_dummy_image_bytes()
+
+    # Create encoding where Euclidean distance to input_encoding (zeros) is exactly 0.5
+    # np.linalg.norm(np.full(100, 0.05)) = sqrt(100 * 0.0025) = 0.5
+    enc_exact = np.zeros(128, dtype=np.float64)
+    enc_exact[:100] = 0.05
+    mock_encodings.return_value = [enc_exact]
+
+    # Exactly equal to tolerance -> match
+    res_equal = verify_candidate_face(input_encoding, dummy_bytes, tolerance=0.5)
+    assert res_equal.is_match is True
+    assert res_equal.best_distance == pytest.approx(0.5)
+
+    # Slightly strictly less tolerance -> no match
+    res_above = verify_candidate_face(input_encoding, dummy_bytes, tolerance=0.4999)
+    assert res_above.is_match is False
+    assert res_above.best_distance == pytest.approx(0.5)
+
+
+@patch("face_recognition.face_encodings")
+@patch("face_recognition.face_locations")
+def test_closest_face_selection(mock_locations, mock_encodings, input_encoding):
+    # Candidate image has 3 faces at different locations
+    loc1 = (0, 10, 10, 0)
+    loc2 = (20, 30, 30, 20)
+    loc3 = (40, 50, 50, 40)
+    mock_locations.return_value = [loc1, loc2, loc3]
+
+    # Face 1 dist = 1.0, Face 2 dist = 0.2, Face 3 dist = 0.5
+    enc1 = np.zeros(128, dtype=np.float64)
+    enc1[0] = 1.0
+    enc2 = np.zeros(128, dtype=np.float64)
+    enc2[0] = 0.2
+    enc3 = np.zeros(128, dtype=np.float64)
+    enc3[0] = 0.5
+    mock_encodings.return_value = [enc1, enc2, enc3]
+
+    dummy_bytes = create_dummy_image_bytes()
+    res = verify_candidate_face(input_encoding, dummy_bytes, tolerance=0.6)
+
+    assert res.is_match is True
+    assert res.best_distance == pytest.approx(0.2)
+    assert res.best_face_location == loc2  # Closest face location selected!
+    assert res.number_of_detected_faces == 3
+
+
+def test_decompression_bomb_safeguard():
+    # Attempting to load an array larger than MAX_IMAGE_PIXELS (25MP)
+    huge_array = np.zeros((6000, 5000, 3), dtype=np.uint8)  # 30 Megapixels
+    loaded = _load_image_from_input(huge_array)
+    assert loaded is None
