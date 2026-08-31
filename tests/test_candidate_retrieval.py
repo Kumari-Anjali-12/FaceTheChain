@@ -5,6 +5,7 @@ Unit tests for candidate image retrieval and SSRF-hardened image downloader in w
 """
 
 import io
+import ipaddress
 import socket
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +15,7 @@ from PIL import Image
 from src.web_search import (
     WebMatch,
     download_candidate_image,
+    is_ip_safe,
     is_safe_url,
     search_by_image,
 )
@@ -374,4 +376,87 @@ def test_redirect_target_ssrf_validation(mock_get, mock_getaddrinfo):
 
     # First URL example.com resolves to public IP, but redirect location goes to 127.0.0.1
     result = download_candidate_image("https://example.com/initial.png")
+    assert result is None
+
+
+def test_is_ip_safe_comprehensive():
+    # Safe public IPs
+    assert is_ip_safe(ipaddress.ip_address("93.184.216.34")) is True
+    assert is_ip_safe(ipaddress.ip_address("8.8.8.8")) is True
+    assert is_ip_safe(ipaddress.ip_address("2001:4860:4860::8888")) is True
+
+    # Loopback
+    assert is_ip_safe(ipaddress.ip_address("127.0.0.1")) is False
+    assert is_ip_safe(ipaddress.ip_address("::1")) is False
+
+    # Private IPv4
+    assert is_ip_safe(ipaddress.ip_address("10.0.0.1")) is False
+    assert is_ip_safe(ipaddress.ip_address("172.16.0.1")) is False
+    assert is_ip_safe(ipaddress.ip_address("192.168.1.1")) is False
+    assert is_ip_safe(ipaddress.ip_address("100.64.0.1")) is False
+
+    # Link-local & Metadata
+    assert is_ip_safe(ipaddress.ip_address("169.254.169.254")) is False
+    assert is_ip_safe(ipaddress.ip_address("fe80::1")) is False
+
+    # IPv6 ULA & Unspecified
+    assert is_ip_safe(ipaddress.ip_address("fc00::1")) is False
+    assert is_ip_safe(ipaddress.ip_address("::")) is False
+    assert is_ip_safe(ipaddress.ip_address("0.0.0.0")) is False
+
+    # IPv4-mapped IPv6
+    assert is_ip_safe(ipaddress.ip_address("::ffff:127.0.0.1")) is False
+    assert is_ip_safe(ipaddress.ip_address("::ffff:10.0.0.1")) is False
+    assert is_ip_safe(ipaddress.ip_address("::ffff:169.254.169.254")) is False
+    assert is_ip_safe(ipaddress.ip_address("::ffff:93.184.216.34")) is True
+
+
+def test_is_safe_url_credentials_and_ports():
+    # User credentials in URL
+    assert is_safe_url("http://user:pass@example.com/image.jpg") is False
+    assert is_safe_url("http://user@example.com/image.jpg") is False
+
+    # Invalid ports
+    assert is_safe_url("http://example.com:0/image.jpg") is False
+    assert is_safe_url("http://example.com:65536/image.jpg") is False
+
+
+@patch("socket.getaddrinfo")
+@patch("requests.Session.get")
+def test_https_to_http_redirect_downgrade_rejected(mock_get, mock_getaddrinfo):
+    mock_getaddrinfo.return_value = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+    ]
+
+    mock_resp_redirect = MagicMock()
+    mock_resp_redirect.status_code = 302
+    mock_resp_redirect.headers = {"Location": "http://example.com/insecure_target.png"}
+    mock_get.return_value = mock_resp_redirect
+
+    # HTTPS URL redirecting to HTTP URL should be disallowed
+    result = download_candidate_image("https://example.com/secure_start.png")
+    assert result is None
+
+
+@patch("socket.getaddrinfo")
+@patch("requests.Session.get")
+def test_decompression_bomb_rejection(mock_get, mock_getaddrinfo):
+    mock_getaddrinfo.return_value = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+    ]
+
+    # Create dummy image larger than 25 Megapixels (6000 x 5000 = 30 MP)
+    large_img = Image.new("RGB", (6000, 5000), color="red")
+    buf = io.BytesIO()
+    large_img.save(buf, format="PNG")
+    bomb_bytes = buf.getvalue()
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"Content-Type": "image/png"}
+    mock_response.iter_content.return_value = [bomb_bytes]
+    mock_get.return_value = mock_response
+
+    # Exceeding 25 MP pixel limit should return None
+    result = download_candidate_image("https://example.com/bomb.png")
     assert result is None

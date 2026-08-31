@@ -48,34 +48,97 @@ class WebMatch:
             self.url = self.page_url or self.direct_image_url or ""
 
 
+MAX_DOWNLOAD_BYTES: int = 10_000_000
+MAX_IMAGE_PIXELS: int = 25_000_000
+
+
+def is_ip_safe(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """
+    Checks whether an IPv4 or IPv6 address is safe (public, globally routable).
+    Rejects loopback, private, link-local, multicast, reserved, unspecified,
+    and IPv4-mapped IPv6 addresses that map to restricted IPv4 ranges.
+    """
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return is_ip_safe(ip.ipv4_mapped)
+
+    if not ip.is_global:
+        return False
+
+    if (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    ):
+        return False
+
+    ip_str = str(ip)
+    if ip_str in ("169.254.169.254", "0.0.0.0", "255.255.255.255", "::", "::1"):
+        return False
+
+    return True
+
+
 def is_safe_url(url: str) -> bool:
     """
-    Validates that a URL uses HTTP/HTTPS scheme and its hostname resolves to a
-    public, non-private, non-loopback, non-link-local IP address.
+    Validates that a URL uses HTTP/HTTPS scheme, contains no user credentials,
+    has a valid port, and resolves ONLY to safe, public IP addresses.
     """
     if not url or not isinstance(url, str):
         return False
 
+    url_trimmed = url.strip()
     try:
-        parsed = urllib.parse.urlparse(url)
+        parsed = urllib.parse.urlparse(url_trimmed)
     except Exception:
         return False
 
-    if parsed.scheme.lower() not in ("http", "https"):
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return False
+
+    # Reject credentials in URL (e.g. http://user:pass@domain.com)
+    if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
         return False
 
     hostname = parsed.hostname
     if not hostname:
         return False
 
-    hostname_lower = hostname.lower().strip()
-    if hostname_lower in ("localhost", "localhost.localdomain") or hostname_lower.endswith(".localhost"):
+    # Strip trailing dot from hostname (e.g., example.com. or localhost.)
+    clean_hostname = hostname.rstrip(".")
+    if not clean_hostname:
         return False
 
-    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    clean_hostname_lower = clean_hostname.lower()
 
+    # Reject localhost aliases
+    if (
+        clean_hostname_lower in ("localhost", "localhost.localdomain", "local")
+        or clean_hostname_lower.endswith(".localhost")
+        or clean_hostname_lower.endswith(".local")
+    ):
+        return False
+
+    # Check port validity
     try:
-        addr_info = socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        port = parsed.port
+    except ValueError:
+        return False
+
+    if port is not None and (port < 1 or port > 65535):
+        return False
+
+    target_port = port or (443 if scheme == "https" else 80)
+
+    # Perform DNS resolution and validate ALL resolved IPv4/IPv6 addresses
+    try:
+        addr_info = socket.getaddrinfo(
+            clean_hostname, target_port, socket.AF_UNSPEC, socket.SOCK_STREAM
+        )
     except Exception:
         return False
 
@@ -89,17 +152,7 @@ def is_safe_url(url: str) -> bool:
         except ValueError:
             return False
 
-        if (
-            ip.is_loopback
-            or ip.is_private
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            return False
-
-        if str(ip) in ("169.254.169.254", "0.0.0.0"):
+        if not is_ip_safe(ip):
             return False
 
     return True
@@ -107,13 +160,16 @@ def is_safe_url(url: str) -> bool:
 
 def download_candidate_image(
     url: str,
-    max_bytes: int = 10_000_000,
-    timeout: int = 10,
+    max_bytes: int = MAX_DOWNLOAD_BYTES,
+    timeout: tuple[float, float] | float = (5.0, 10.0),
 ) -> bytes | None:
     """
     Safely downloads a candidate image with strict SSRF protection, size limits,
     redirect validation, and decodable image content verification.
     """
+    if not url or not isinstance(url, str):
+        return None
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -124,81 +180,105 @@ def download_candidate_image(
 
     current_url = url
     max_redirects = 3
+    initial_scheme = urllib.parse.urlparse(url).scheme.lower()
 
     session = requests.Session()
 
-    for redirect_count in range(max_redirects + 1):
-        if not is_safe_url(current_url):
-            return None
+    try:
+        for redirect_count in range(max_redirects + 1):
+            if not is_safe_url(current_url):
+                return None
 
-        try:
-            response = session.get(
-                current_url,
-                headers=headers,
-                stream=True,
-                allow_redirects=False,
-                timeout=timeout,
-                verify=True,
-            )
-        except Exception:
-            return None
+            try:
+                response = session.get(
+                    current_url,
+                    headers=headers,
+                    stream=True,
+                    allow_redirects=False,
+                    timeout=timeout,
+                    verify=True,
+                )
+            except Exception:
+                return None
 
-        if response.status_code in (301, 302, 303, 307, 308):
-            if redirect_count >= max_redirects:
+            # Handle HTTP 3xx Redirects
+            if response.status_code in (301, 302, 303, 307, 308):
+                if redirect_count >= max_redirects:
+                    response.close()
+                    return None
+
+                location = response.headers.get("Location")
+                response.close()
+
+                if not location:
+                    return None
+
+                target_url = urllib.parse.urljoin(current_url, location)
+                target_scheme = urllib.parse.urlparse(target_url).scheme.lower()
+
+                # Disallow scheme downgrade (HTTPS -> HTTP)
+                if initial_scheme == "https" and target_scheme == "http":
+                    return None
+
+                current_url = target_url
+                continue
+
+            if response.status_code != 200:
                 response.close()
                 return None
 
-            location = response.headers.get("Location")
-            response.close()
-
-            if not location:
+            # Validate Content-Type
+            content_type = response.headers.get("Content-Type", "").lower().strip()
+            if not content_type or not content_type.startswith("image/"):
+                response.close()
                 return None
 
-            current_url = urllib.parse.urljoin(current_url, location)
-            continue
-
-        if response.status_code != 200:
-            response.close()
-            return None
-
-        content_type = response.headers.get("Content-Type", "").lower().strip()
-        if not content_type.startswith("image/"):
-            response.close()
-            return None
-
-        content_length_hdr = response.headers.get("Content-Length")
-        if content_length_hdr:
-            try:
-                if int(content_length_hdr) > max_bytes:
-                    response.close()
-                    return None
-            except ValueError:
-                pass
-
-        downloaded = bytearray()
-        try:
-            for chunk in response.iter_content(chunk_size=65536):
-                if chunk:
-                    downloaded.extend(chunk)
-                    if len(downloaded) > max_bytes:
+            # Check Content-Length header if present
+            content_length_hdr = response.headers.get("Content-Length")
+            if content_length_hdr:
+                try:
+                    if int(content_length_hdr) > max_bytes:
                         response.close()
                         return None
-        except Exception:
-            response.close()
-            return None
-        finally:
-            response.close()
+                except ValueError:
+                    pass
 
-        image_bytes = bytes(downloaded)
-        if not image_bytes:
-            return None
+            # Stream body in chunks to prevent memory exhaustion
+            downloaded = bytearray()
+            try:
+                for chunk in response.iter_content(chunk_size=65536):
+                    if chunk:
+                        downloaded.extend(chunk)
+                        if len(downloaded) > max_bytes:
+                            response.close()
+                            return None
+            except Exception:
+                response.close()
+                return None
+            finally:
+                response.close()
 
-        try:
-            with Image.open(io.BytesIO(image_bytes)) as img:
-                img.verify()
-            return image_bytes
-        except Exception:
-            return None
+            image_bytes = bytes(downloaded)
+            if not image_bytes:
+                return None
+
+            # Validate image with PIL (including pixel size / decompression bomb check)
+            try:
+                with Image.open(io.BytesIO(image_bytes)) as img:
+                    img.verify()
+                with Image.open(io.BytesIO(image_bytes)) as img:
+                    width, height = img.size
+                    if width * height > MAX_IMAGE_PIXELS:
+                        return None
+                    img.load()
+                return image_bytes
+            except Exception:
+                return None
+
+    except Exception:
+        return None
+    finally:
+        session.close()
 
     return None
 
