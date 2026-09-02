@@ -2,44 +2,293 @@
 web_search.py
 -------------
 Stage 2 of the pipeline: given an image, run a genuine reverse-image
-search against the web and return candidate matching pages/posts.
+search against the web and return candidate matching pages/posts and
+direct image URLs.
 
 Uses Google Cloud Vision API's Web Detection feature, which crawls the
 web for pages containing full or partial matches of the image and
-returns their URLs, page titles, and best-guess labels. This is a real
-search call, not a lookup table.
+returns their URLs, page titles, and best-guess labels.
 
-Requires a Google Cloud project with the Vision API enabled and a
-service-account key. Set GOOGLE_APPLICATION_CREDENTIALS to the path
-of your key JSON, or export GOOGLE_VISION_API_KEY for the simpler
-REST API-key flow (see README).
-
-IMPORTANT (ethics/consent):
-Run this only against images you have the right to search — e.g. your
-own photo, or a teammate's with their explicit consent for the demo.
-Do not use this to locate a stranger's social media accounts without
-their permission.
+Also includes `download_candidate_image()` for securely fetching candidate
+image assets with strict SSRF protection, size limits, redirect validation,
+and image format verification.
 """
 
 from __future__ import annotations
 
+import io
+import ipaddress
 import os
+import socket
+import urllib.parse
 from dataclasses import dataclass
+from typing import Any
+
+import requests
+from PIL import Image
 
 
 @dataclass
 class WebMatch:
-    url: str
-    page_title: str | None
-    match_type: str  # "full_matching_image" | "partial_matching_image" | "pages_with_matching_images"
+    url: str = ""
+    page_title: str | None = None
+    match_type: str = ""  # "full_matching_image" | "partial_matching_image" | "visually_similar_image" | "pages_with_matching_images" | etc.
     score: float | None = None
+    direct_image_url: str | None = None
+    page_url: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.page_url and not self.direct_image_url and self.url:
+            url_lower = self.url.lower()
+            if any(url_lower.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+                self.direct_image_url = self.url
+            else:
+                self.page_url = self.url
+        elif not self.url:
+            self.url = self.page_url or self.direct_image_url or ""
+
+
+MAX_DOWNLOAD_BYTES: int = 10_000_000
+MAX_IMAGE_PIXELS: int = 25_000_000
+
+
+def is_ip_safe(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """
+    Checks whether an IPv4 or IPv6 address is safe (public, globally routable).
+    Rejects loopback, private, link-local, multicast, reserved, unspecified,
+    and IPv4-mapped IPv6 addresses that map to restricted IPv4 ranges.
+    """
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return is_ip_safe(ip.ipv4_mapped)
+
+    if not ip.is_global:
+        return False
+
+    if (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    ):
+        return False
+
+    ip_str = str(ip)
+    if ip_str in ("169.254.169.254", "0.0.0.0", "255.255.255.255", "::", "::1"):
+        return False
+
+    return True
+
+
+def is_safe_url(url: str) -> bool:
+    """
+    Validates that a URL uses HTTP/HTTPS scheme, contains no user credentials,
+    has a valid port, and resolves ONLY to safe, public IP addresses.
+    """
+    if not url or not isinstance(url, str):
+        return False
+
+    url_trimmed = url.strip()
+    try:
+        parsed = urllib.parse.urlparse(url_trimmed)
+    except Exception:
+        return False
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return False
+
+    # Reject credentials in URL (e.g. http://user:pass@domain.com)
+    if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
+        return False
+
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+
+    # Strip trailing dot from hostname (e.g., example.com. or localhost.)
+    clean_hostname = hostname.rstrip(".")
+    if not clean_hostname:
+        return False
+
+    clean_hostname_lower = clean_hostname.lower()
+
+    # Reject localhost aliases
+    if (
+        clean_hostname_lower in ("localhost", "localhost.localdomain", "local")
+        or clean_hostname_lower.endswith(".localhost")
+        or clean_hostname_lower.endswith(".local")
+    ):
+        return False
+
+    # Check port validity
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+
+    if port is not None and (port < 1 or port > 65535):
+        return False
+
+    target_port = port or (443 if scheme == "https" else 80)
+
+    # Perform DNS resolution and validate ALL resolved IPv4/IPv6 addresses
+    try:
+        addr_info = socket.getaddrinfo(
+            clean_hostname, target_port, socket.AF_UNSPEC, socket.SOCK_STREAM
+        )
+    except Exception:
+        return False
+
+    if not addr_info:
+        return False
+
+    for family, socktype, proto, canonname, sockaddr in addr_info:
+        ip_str = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+
+        if not is_ip_safe(ip):
+            return False
+
+    return True
+
+
+def download_candidate_image(
+    url: str,
+    max_bytes: int = MAX_DOWNLOAD_BYTES,
+    timeout: tuple[float, float] | float = (5.0, 10.0),
+) -> bytes | None:
+    """
+    Safely downloads a candidate image with strict SSRF protection, size limits,
+    redirect validation, and decodable image content verification.
+    """
+    if not url or not isinstance(url, str):
+        return None
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+
+    current_url = url
+    max_redirects = 3
+    initial_scheme = urllib.parse.urlparse(url).scheme.lower()
+
+    session = requests.Session()
+
+    try:
+        for redirect_count in range(max_redirects + 1):
+            if not is_safe_url(current_url):
+                return None
+
+            try:
+                response = session.get(
+                    current_url,
+                    headers=headers,
+                    stream=True,
+                    allow_redirects=False,
+                    timeout=timeout,
+                    verify=True,
+                )
+            except Exception:
+                return None
+
+            # Handle HTTP 3xx Redirects
+            if response.status_code in (301, 302, 303, 307, 308):
+                if redirect_count >= max_redirects:
+                    response.close()
+                    return None
+
+                location = response.headers.get("Location")
+                response.close()
+
+                if not location:
+                    return None
+
+                target_url = urllib.parse.urljoin(current_url, location)
+                target_scheme = urllib.parse.urlparse(target_url).scheme.lower()
+
+                # Disallow scheme downgrade (HTTPS -> HTTP)
+                if initial_scheme == "https" and target_scheme == "http":
+                    return None
+
+                current_url = target_url
+                continue
+
+            if response.status_code != 200:
+                response.close()
+                return None
+
+            # Validate Content-Type
+            content_type = response.headers.get("Content-Type", "").lower().strip()
+            if not content_type or not content_type.startswith("image/"):
+                response.close()
+                return None
+
+            # Check Content-Length header if present
+            content_length_hdr = response.headers.get("Content-Length")
+            if content_length_hdr:
+                try:
+                    if int(content_length_hdr) > max_bytes:
+                        response.close()
+                        return None
+                except ValueError:
+                    pass
+
+            # Stream body in chunks to prevent memory exhaustion
+            downloaded = bytearray()
+            try:
+                for chunk in response.iter_content(chunk_size=65536):
+                    if chunk:
+                        downloaded.extend(chunk)
+                        if len(downloaded) > max_bytes:
+                            response.close()
+                            return None
+            except Exception:
+                response.close()
+                return None
+            finally:
+                response.close()
+
+            image_bytes = bytes(downloaded)
+            if not image_bytes:
+                return None
+
+            # Validate image with PIL (including pixel size / decompression bomb check)
+            try:
+                with Image.open(io.BytesIO(image_bytes)) as img:
+                    img.verify()
+                with Image.open(io.BytesIO(image_bytes)) as img:
+                    width, height = img.size
+                    if width * height > MAX_IMAGE_PIXELS:
+                        return None
+                    img.load()
+                return image_bytes
+            except Exception:
+                return None
+
+    except Exception:
+        return None
+    finally:
+        session.close()
+
+    return None
 
 
 def search_by_image(image_path: str, max_results: int = 10) -> list[WebMatch]:
     """
     Reverse-image search via Google Cloud Vision Web Detection.
 
-    Returns a list of WebMatch objects, best matches first.
+    Returns a deduplicated list of WebMatch objects, including direct image URLs
+    and originating page URLs.
     """
     try:
         from google.cloud import vision
@@ -66,30 +315,96 @@ def search_by_image(image_path: str, max_results: int = 10) -> list[WebMatch]:
         raise RuntimeError(f"Vision API error: {response.error.message}")
 
     web_detection = response.web_detection
-    matches: list[WebMatch] = []
+    raw_matches: list[WebMatch] = []
 
-    # Full matches are the strongest signal (near-identical image found elsewhere).
-    for page in web_detection.pages_with_matching_images[:max_results]:
-        matches.append(
+    # 1. Page-level matching images & full/partial sub-images
+    for page in getattr(web_detection, "pages_with_matching_images", []):
+        page_url = page.url if hasattr(page, "url") else None
+        page_title = page.page_title or None if hasattr(page, "page_title") else None
+        page_score = page.score if hasattr(page, "score") else None
+
+        has_direct_imgs = False
+        for img in getattr(page, "full_matching_images", []):
+            has_direct_imgs = True
+            raw_matches.append(
+                WebMatch(
+                    direct_image_url=img.url,
+                    page_url=page_url,
+                    page_title=page_title,
+                    match_type="page_full_matching_image",
+                    score=getattr(img, "score", page_score),
+                )
+            )
+
+        for img in getattr(page, "partial_matching_images", []):
+            has_direct_imgs = True
+            raw_matches.append(
+                WebMatch(
+                    direct_image_url=img.url,
+                    page_url=page_url,
+                    page_title=page_title,
+                    match_type="page_partial_matching_image",
+                    score=getattr(img, "score", page_score),
+                )
+            )
+
+        if not has_direct_imgs and page_url:
+            raw_matches.append(
+                WebMatch(
+                    direct_image_url=None,
+                    page_url=page_url,
+                    page_title=page_title,
+                    match_type="pages_with_matching_images",
+                    score=page_score,
+                )
+            )
+
+    # 2. Full matching images
+    for img in getattr(web_detection, "full_matching_images", []):
+        raw_matches.append(
             WebMatch(
-                url=page.url,
-                page_title=page.page_title or None,
-                match_type="pages_with_matching_images",
-                score=page.score if hasattr(page, "score") else None,
+                direct_image_url=img.url,
+                page_url=None,
+                page_title=None,
+                match_type="full_matching_image",
+                score=getattr(img, "score", None),
             )
         )
 
-    for img in web_detection.full_matching_images[:max_results]:
-        matches.append(
-            WebMatch(url=img.url, page_title=None, match_type="full_matching_image", score=img.score)
+    # 3. Partial matching images
+    for img in getattr(web_detection, "partial_matching_images", []):
+        raw_matches.append(
+            WebMatch(
+                direct_image_url=img.url,
+                page_url=None,
+                page_title=None,
+                match_type="partial_matching_image",
+                score=getattr(img, "score", None),
+            )
         )
 
-    for img in web_detection.partial_matching_images[:max_results]:
-        matches.append(
-            WebMatch(url=img.url, page_title=None, match_type="partial_matching_image", score=img.score)
+    # 4. Visually similar images
+    for img in getattr(web_detection, "visually_similar_images", []):
+        raw_matches.append(
+            WebMatch(
+                direct_image_url=img.url,
+                page_url=None,
+                page_title=None,
+                match_type="visually_similar_image",
+                score=getattr(img, "score", None),
+            )
         )
 
-    return matches[:max_results]
+    # Deduplicate while preserving deterministic order
+    seen = set()
+    deduped_matches: list[WebMatch] = []
+    for match in raw_matches:
+        key = (match.direct_image_url, match.page_url)
+        if key not in seen:
+            seen.add(key)
+            deduped_matches.append(match)
+
+    return deduped_matches[:max_results]
 
 
 def pick_best_social_match(matches: list[WebMatch]) -> WebMatch | None:
@@ -118,7 +433,7 @@ if __name__ == "__main__":
 
     results = search_by_image(sys.argv[1])
     for m in results:
-        print(f"[{m.match_type}] {m.url} (score={m.score})")
+        print(f"[{m.match_type}] img={m.direct_image_url} page={m.page_url} (score={m.score})")
 
     best = pick_best_social_match(results)
     if best:
